@@ -17,6 +17,7 @@ from ome_types.model import (
     PixelType,
     Plane,
     Plate,
+    TiffData,
     UnitsLength,
     UnitsTime,
     Well,
@@ -100,16 +101,24 @@ class _PositionKey(NamedTuple):
     g_index: int | None = None
 
     def __str__(self) -> str:
-        p_name = self.name or f"Pos{self.p_index:04d}"
         if self.g_index is not None:
-            return f"{p_name}_Grid{self.g_index:04d}_{self.p_index}"
+            # if it has a name, include it in the position string before grid
+            # (e.g. name_p0000_g0000)
+            if self.name:
+                return f"{self.name}_p{self.p_index:04d}_g{self.g_index:04d}"
+            # otherwise just use p and g indices (e.g. p0000_g0000)
+            return f"p{self.p_index:04d}_g{self.g_index:04d}"
         else:
-            return f"{p_name}_{self.p_index}"
+            # if it has a name, include it in the position string (e.g. name_p0000)
+            if self.name:
+                return f"{self.name}_p{self.p_index:04d}"
+            # otherwise just use p index (e.g. p0000)
+            return f"p{self.p_index:04d}"
 
     @property
     def image_id(self) -> str:
         if self.g_index is not None:
-            return f"{self.p_index}_{self.g_index}"
+            return f"{self.p_index}:{self.g_index}"
         return f"{self.p_index}"
 
 
@@ -235,15 +244,29 @@ def _extract_dimension_order_from_sequence(
 ) -> Pixels_DimensionOrder:
     """Extract axis order from a useq.MDASequence.
 
+    useq axis_order represents iteration order (outermost to innermost loop),
+    while OME DimensionOrder represents rasterization order (slowest to fastest
+    varying dimension). Since planes are stored in the order they're generated,
+    we need to reverse the useq axis order to get the OME dimension order.
+
+    For example, if useq axis_order="tpzc":
+    - Iteration: for t in times: for p in positions: for z in z_steps: for c in channels
+    - Plane storage: t0-z0-c0, t0-z0-c1, t0-z1-c0, t0-z1-c1, t1-z0-c0, ...
+    - This means C varies fastest, then Z, then T → OME order "XYCZT"
+
     Returns
     -------
     A Pixels_DimensionOrder representing the dimension order compatible with OME
-    standards
-    (e.g., "XYCZT").
+    standards (e.g., "XYCZT").
     """
-    filtered_axes = (axis for axis in sequence.axis_order if axis not in {"p", "g"})
-    dimension_order = "XY" + "".join(filtered_axes).upper()
+    # Filter out 'p' and 'g' axes since they don't exist within a single OME Image
+    filtered_axes = [axis for axis in sequence.axis_order if axis not in {"p", "g"}]
 
+    # Reverse the order since useq is iteration order, OME is rasterization order
+    reversed_axes = filtered_axes[::-1]
+    dimension_order = "XY" + "".join(reversed_axes).upper()
+
+    # Ensure we have exactly 5 dimensions by adding missing ones
     if len(dimension_order) != 5:
         missing_axes = [axis for axis in "XYCZT" if axis not in dimension_order]
         dimension_order += "".join(missing_axes)
@@ -375,8 +398,6 @@ def _build_pixels_object(
     position_frames: list[FrameMetaV1],
 ) -> Pixels:
     """Build a Pixels object with the given parameters."""
-    from ome_types.model import MetadataOnly
-
     return Pixels(
         id=f"Pixels:{image_id}",
         dimension_order=dimension_order,
@@ -391,9 +412,34 @@ def _build_pixels_object(
         physical_size_y=dimension_info.pixel_size_um,
         physical_size_y_unit=UnitsLength.MICROMETER,
         channels=channels,
-        metadata_only=MetadataOnly(),
+        tiff_data_blocks=_build_tiff_data_list(position_frames),
         planes=_build_plane_list(position_frames),
     )
+
+
+def _build_tiff_data_list(position_frames: list[FrameMetaV1]) -> list[TiffData]:
+    """Build TiffData objects for frame metadata at a specific position."""
+    tiff_data_blocks = []
+    for frame_metadata in position_frames:
+        mda_event = _extract_mda_event(frame_metadata)
+        if mda_event is None:  # pragma: no cover
+            continue
+
+        event_index = mda_event.index
+        z_index = event_index.get("z", 0)
+        c_index = event_index.get("c", 0)
+        t_index = event_index.get("t", 0)
+
+        # Create a TiffData block for this plane
+        tiff_data = TiffData(
+            first_z=z_index,
+            first_c=c_index,
+            first_t=t_index,
+            plane_count=1,
+        )
+        tiff_data_blocks.append(tiff_data)
+
+    return tiff_data_blocks
 
 
 def _build_plane_list(position_frames: list[FrameMetaV1]) -> list[Plane]:
@@ -442,16 +488,22 @@ def _build_ome_plate(
     # create a mapping from well name to acquisition indices
     well_acquisition_map: dict[str, list[int]] = {}
     for acquisition_index, position in enumerate(plate_plan.image_positions):
-        well_name = position.name
-        if well_name is not None:
-            if well_name not in well_acquisition_map:
-                well_acquisition_map[well_name] = []
-            well_acquisition_map[well_name].append(acquisition_index)
+        if (position_name := position.name) is not None:
+            # Extract base well name by removing FOV suffix ("A1_0000" -> "A1")
+            # This handles cases where well_points_plan creates multiple FOVs per well
+            base_well_name = position_name.split("_")[0]
 
-    for (row, col), name, pos in zip(
-        plate_plan.selected_well_indices,
-        plate_plan.selected_well_names,
-        plate_plan.selected_well_positions,
+            if base_well_name not in well_acquisition_map:
+                well_acquisition_map[base_well_name] = []
+
+            well_acquisition_map[base_well_name].append(acquisition_index)
+
+    for well_index, ((row, col), name, pos) in enumerate(
+        zip(
+            plate_plan.selected_well_indices,
+            plate_plan.selected_well_names,
+            plate_plan.selected_well_positions,
+        )
     ):
         # get all acquisition indices for this well
         acquisition_indices = well_acquisition_map.get(name, [])
@@ -475,6 +527,7 @@ def _build_ome_plate(
 
         wells.append(
             Well(
+                id=f"Well:{well_index}",
                 row=row,
                 column=col,
                 well_samples=well_samples,
@@ -482,6 +535,7 @@ def _build_ome_plate(
         )
 
     return Plate(
+        id="Plate:0",
         name=plate_plan.plate.name,
         rows=plate_plan.plate.rows,
         columns=plate_plan.plate.columns,
