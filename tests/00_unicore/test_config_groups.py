@@ -231,3 +231,154 @@ def test_rename_and_delete_python_config_group():
     # Deleting should remove python configs as well
     core.deleteConfigGroup("py_group_renamed")
     assert "py_group_renamed" not in core.getAvailableConfigGroups()
+
+
+def test_state_label_synchronization():
+    """Verify State and Label stay synchronized during config operations."""
+    core = UniMMCore()
+
+    class SimStateDevice(StateDevice):
+        def __init__(self, label: str, state_dict: dict[int, str]) -> None:
+            super().__init__(state_dict)
+            self._current_state = 0
+            self._current_label = self._state_to_label.get(self._current_state)
+
+        def get_state(self) -> int:
+            return self._current_state
+
+        def set_state(self, position: int | str) -> None:
+            if isinstance(position, str):
+                position = int(position)
+            self._current_state = position
+            self._current_label = self._state_to_label.get(self._current_state)
+
+    core.loadPyDevice(
+        "PyLED",
+        SimStateDevice(label="PyLED", state_dict={0: "UV", 1: "BLUE", 2: "RED"}),
+    )
+    core.initializeDevice("PyLED")
+
+    # Test 1: Config with State property should set Label too
+    core.defineConfigGroup("test")
+    core.defineConfig("test", "state_cfg", "PyLED", "State", "1")
+    core.setConfig("test", "state_cfg")
+
+    assert core.getState("PyLED") == 1
+    assert core.getStateLabel("PyLED") == "BLUE"  # Should be synced!
+
+    # Test 2: Config with Label property should set State too
+    core.defineConfig("test", "label_cfg", "PyLED", "Label", "RED")
+    core.setConfig("test", "label_cfg")
+
+    assert core.getStateLabel("PyLED") == "RED"
+    assert core.getState("PyLED") == 2  # Should be synced!
+
+    # Test 3: Invalid state should raise error (not fall back silently)
+    core.defineConfig("test", "invalid_cfg", "PyLED", "State", "999")
+    with pytest.raises(ValueError, match="Position 999 is not a valid state"):
+        core.setConfig("test", "invalid_cfg")
+
+    # Test 4: Invalid label should raise error
+    core.defineConfig("test", "invalid_label", "PyLED", "Label", "INVALID")
+    with pytest.raises(RuntimeError, match="Label not defined: 'INVALID'"):
+        core.setConfig("test", "invalid_label")
+
+
+def test_multiple_properties_per_device_in_config():
+    """Test configs with multiple properties for the same device."""
+    core = UniMMCore()
+
+    class ComplexStateDevice(StateDevice):
+        def __init__(self, label: str, state_dict: dict[int, str]) -> None:
+            super().__init__(state_dict)
+            self._current_state = 0
+            self._current_label = self._state_to_label.get(self._current_state)
+            self._intensity = 50  # Additional property
+
+        def get_state(self) -> int:
+            return self._current_state
+
+        def set_state(self, position: int | str) -> None:
+            if isinstance(position, str):
+                position = int(position)
+            self._current_state = position
+            self._current_label = self._state_to_label.get(self._current_state)
+
+        def get_property_names(self) -> tuple[str, ...]:
+            return (*super().get_property_names(), "Intensity")
+
+        def get_property_value(self, prop_name: str) -> int | str:
+            if prop_name == "Intensity":
+                return self._intensity
+            return super().get_property_value(prop_name)
+
+        def set_property_value(self, prop_name: str, value: int | str) -> None:
+            if prop_name == "Intensity":
+                self._intensity = int(value)
+            else:
+                super().set_property_value(prop_name, value)
+
+    core.loadPyDevice(
+        "PyLED",
+        ComplexStateDevice(label="PyLED", state_dict={0: "UV", 1: "BLUE"}),
+    )
+    core.initializeDevice("PyLED")
+
+    # Define config with multiple properties for same device
+    core.defineConfigGroup("channel")
+    core.defineConfig("channel", "uv_bright", "PyLED", "Label", "UV")
+    core.defineConfig("channel", "uv_bright", "PyLED", "Intensity", "100")
+
+    # Set to different state first
+    core.setStateLabel("PyLED", "BLUE")
+    core.setProperty("PyLED", "Intensity", "50")
+
+    # Apply config - should set both properties
+    core.setConfig("channel", "uv_bright")
+
+    assert core.getStateLabel("PyLED") == "UV"
+    assert core.getProperty("PyLED", "Intensity") == 100  # Returns int, not string
+
+    # Verify config data includes both properties
+    config_data = core.getConfigData("channel", "uv_bright")
+    assert ("PyLED", "Label", "UV") in config_data
+    assert ("PyLED", "Intensity", "100") in config_data
+
+
+def test_is_config_defined_for_pydevice():
+    """Test isConfigDefined works for pydevice-only configs."""
+    core = UniMMCore()
+
+    class SimStateDevice(StateDevice):
+        def __init__(self, label: str, state_dict: dict[int, str]) -> None:
+            super().__init__(state_dict)
+            self._current_state = 0
+            self._current_label = self._state_to_label.get(self._current_state)
+
+        def get_state(self) -> int:
+            return self._current_state
+
+        def set_state(self, position: int | str) -> None:
+            if isinstance(position, str):
+                position = int(position)
+            self._current_state = position
+            self._current_label = self._state_to_label.get(self._current_state)
+
+    core.loadPyDevice(
+        "PyLED", SimStateDevice(label="PyLED", state_dict={0: "UV", 1: "BLUE"})
+    )
+    core.initializeDevice("PyLED")
+
+    # Before defining config
+    assert not core.isConfigDefined("test", "cfg1")
+
+    # After defining config
+    core.defineConfigGroup("test")
+    core.defineConfig("test", "cfg1", "PyLED", "Label", "UV")
+    assert core.isConfigDefined("test", "cfg1")
+
+    # Non-existent config
+    assert not core.isConfigDefined("test", "cfg_doesnt_exist")
+
+    # Non-existent group
+    assert not core.isConfigDefined("group_doesnt_exist", "cfg1")
