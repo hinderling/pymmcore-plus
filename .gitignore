@@ -148,3 +148,6 @@ docs/_includes/_cmmcoreplus_members.md
 example_*.some.tiff
 example.zarr
 uv.lock
+
+# MacOS
+.DS_Store
