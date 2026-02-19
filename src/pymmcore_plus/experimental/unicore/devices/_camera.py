@@ -4,6 +4,8 @@ from abc import abstractmethod
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Literal
 
+import numpy as np
+
 from pymmcore_plus.core._constants import DeviceType, Keyword, PixelFormat
 
 from ._device_base import Device
@@ -11,7 +13,6 @@ from ._device_base import Device
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
-    import numpy as np
     from numpy.typing import DTypeLike
 
 
@@ -31,19 +32,39 @@ class CameraDevice(Device):
         ...
 
     @abstractmethod
-    def shape(self) -> tuple[int, ...]:
-        """Return the shape of the image buffer.
+    def sensor_shape(self) -> tuple[int, ...]:
+        """Return the full sensor shape of the image buffer.
 
-        This is used when querying Width, Height, *and* number of components.
-        If the camera is grayscale, it should return (width, height).
-        If the camera is color, it should return (width, height, n_channels).
+        This is used when querying the full sensor dimensions.
+        If the camera is grayscale, it should return (height, width).
+        If the camera is color, it should return (height, width, n_channels).
         """
 
     @abstractmethod
     def dtype(self) -> DTypeLike:
         """Return the data type of the image buffer."""
 
-    @abstractmethod
+    def snap(self, buffer: np.ndarray) -> Mapping:
+        """Snap a single image into the provided buffer.
+
+        Fill the provided buffer with image data and return metadata.
+        The buffer will be sized to ``sensor_shape()`` (full frame).
+
+        Parameters
+        ----------
+        buffer : np.ndarray
+            Pre-allocated buffer to fill with image data. Shaped to
+            ``sensor_shape()``.
+
+        Returns
+        -------
+        Mapping
+            Metadata for the acquired image.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement snap() or start_sequence()"
+        )
+
     def start_sequence(
         self,
         n: int | None,
@@ -51,12 +72,12 @@ class CameraDevice(Device):
     ) -> Iterator[Mapping]:
         """Start a sequence acquisition.
 
-        This method should be implemented by the camera device adapter and should
-        yield metadata for each acquired image. The implementation should call
-        get_buffer() to get a buffer, fill it with image data, then yield the
-        metadata for that image.
+        The default implementation calls ``snap()`` for each frame. If the
+        camera has an active ROI, the default will snap into a reusable
+        full-frame buffer and copy the cropped region into the output buffer.
 
-        The core will handle threading and synchronization.  This function may block.
+        Override this method only if your camera needs full control over
+        the acquisition loop (e.g. hardware-triggered sequences).
 
         Parameters
         ----------
@@ -64,46 +85,40 @@ class CameraDevice(Device):
             If an integer, this is the number of images to acquire.
             If None, the camera should acquire images indefinitely until stopped.
         get_buffer : Callable[[Sequence[int], DTypeLike], np.ndarray]
-            A callable that returns a buffer for the camera to fill with image data.
-            You should call this with the shape of the image and the dtype
-            of the image data.  The core will produce a buffer of the requested shape
-            and dtype, and you should fill it (in place) with the image data.
+            A callable that returns a buffer for the camera to fill with image
+            data.
 
         Yields
         ------
         Mapping
-            Metadata for each acquired image. This should be yielded after the
-            corresponding buffer has been filled with image data.
+            Metadata for each acquired image.
         """
-        # EXAMPLE USAGE:
-        # shape, dtype = self.shape(), self.dtype()
-        # if n is None:  # acquire indefinitely until stopped
-        #    while True:
-        #        yield ...
-        #    return
-        # for _ in range(n):
-        #     image = get_buffer(shape, dtype)
-        #     get the image from the camera, and fill the buffer in place
-        #     image[:] = <your_camera_data>
-        #     notify the core that the buffer is ready, and provide any metadata
-        #     yield {"key": "value", ...}  # metadata for the image
+        sensor = self.sensor_shape()
+        roi = self._roi
+        dtype = self.dtype()
 
-        #     TODO:
-        #     Open question: who is responsible for key pieces of metadata?
-        #     in CMMCore, each of the camera device adapters is responsible for
-        #     injecting to following bits of metadata:
-        #     - MM::g_Keyword_Metadata_CameraLabel
-        #     - MM::g_Keyword_Elapsed_Time_ms (GetCurrentMMTime - start_time)
-        #     - MM::g_Keyword_Metadata_ROI_X
-        #     - MM::g_Keyword_Metadata_ROI_Y
-        #     - MM::g_Keyword_Binning
-        #     --- while the CircularBuffer InsertMultiChannel is responsible for adding:
-        #     - MM::g_Keyword_Metadata_ImageNumber
-        #     - MM::g_Keyword_Elapsed_Time_ms
-        #     - MM::g_Keyword_Metadata_TimeInCore
-        #     - MM::g_Keyword_Metadata_Width
-        #     - MM::g_Keyword_Metadata_Height
-        #     - MM::g_Keyword_PixelType
+        if roi is None:
+            # No ROI — snap directly into the output buffer (zero overhead)
+            count = 0
+            limit = n if n is not None else 2**63
+            while count < limit:
+                buf = get_buffer(sensor, dtype)
+                meta = self.snap(buf)
+                yield meta
+                count += 1
+        else:
+            # ROI active — snap into full-frame buffer, crop into output
+            x, y, w, h = roi
+            full_buf = np.empty(sensor, dtype=dtype)
+            count = 0
+            limit = n if n is not None else 2**63
+            while count < limit:
+                roi_shape = self.shape()
+                out = get_buffer(roi_shape, dtype)
+                meta = self.snap(full_buf)
+                out[:] = full_buf[y : y + h, x : x + w]
+                yield meta
+                count += 1
 
     # Standard Properties --------------------------------------------
 
@@ -170,6 +185,14 @@ class CameraDevice(Device):
     # def set_ccd_temperature_set_point(self, value: str) -> None:
 
     def __init__(self) -> None:
+        # Validate that subclass implements snap() or start_sequence()
+        if (
+            type(self).snap is CameraDevice.snap
+            and type(self).start_sequence is CameraDevice.start_sequence
+        ):
+            raise TypeError(
+                f"{type(self).__name__} must implement snap() or start_sequence()"
+            )
         super().__init__()
         self.register_standard_properties()
 
@@ -191,6 +214,49 @@ class CameraDevice(Device):
                     sequence_starter=seq_starter,
                     sequence_stopper=seq_stopper,
                 )
+
+    # ROI support -----------------------------------------------------
+
+    _roi: tuple[int, int, int, int] | None = None
+
+    def shape(self) -> tuple[int, ...]:
+        """Return the current image shape, accounting for any active ROI.
+
+        If an ROI is set, returns ``(height, width)`` of the ROI.
+        Otherwise returns ``sensor_shape()``.
+        """
+        if self._roi is not None:
+            _, _, w, h = self._roi
+            return (h, w)
+        return self.sensor_shape()
+
+    def get_roi(self) -> tuple[int, int, int, int]:
+        """Return the current ROI as ``(x, y, width, height)``.
+
+        Returns the stored ROI or the full sensor frame if none is set.
+        """
+        if self._roi is not None:
+            return self._roi
+        h, w, *_ = self.sensor_shape()
+        return (0, 0, w, h)
+
+    def set_roi(self, x: int, y: int, width: int, height: int) -> None:
+        """Set the ROI, validating bounds against the sensor shape."""
+        h, w, *_ = self.sensor_shape()
+        if x < 0 or y < 0 or width <= 0 or height <= 0:
+            raise ValueError(
+                f"Invalid ROI ({x}, {y}, {width}, {height}): "
+                "coordinates must be non-negative and dimensions positive."
+            )
+        if x + width > w or y + height > h:
+            raise ValueError(
+                f"ROI ({x}, {y}, {width}, {height}) exceeds sensor bounds ({w}x{h})."
+            )
+        self._roi = (x, y, width, height)
+
+    def clear_roi(self) -> None:
+        """Reset the ROI to the full sensor frame."""
+        self._roi = None
 
     # Standard Properties, default implementations -------------------
 

@@ -1075,6 +1075,12 @@ class UniMMCore(CMMCorePlus):
             return pymmcore.CMMCore.snapImage(self)
 
         buf = None
+        roi = cam.get_roi()
+        sensor = cam.sensor_shape()
+        has_roi = roi[:2] != (0, 0) or (roi[2], roi[3]) != (
+            sensor[1],
+            sensor[0],
+        )
 
         def _get_buffer(shape: Sequence[int], dtype: DTypeLike) -> np.ndarray:
             """Get a buffer for the camera image."""
@@ -1086,6 +1092,11 @@ class UniMMCore(CMMCorePlus):
         with cam:
             for _ in cam.start_sequence(1, get_buffer=_get_buffer):
                 if buf is not None:
+                    # Core-level crop fallback: if adapter returned a
+                    # full-sensor buffer but ROI is active, crop it.
+                    if has_roi and buf.shape[:2] == sensor[:2]:
+                        x, y, w, h = roi
+                        buf = buf[y : y + h, x : x + w].copy()
                     self._current_image_buffer = buf
                 else:  # pragma: no cover  #  bad camera implementation
                     warnings.warn(
@@ -1126,22 +1137,42 @@ class UniMMCore(CMMCorePlus):
         shape, dtype = cam.shape(), np.dtype(cam.dtype())
         camera_label = cam.get_label()
 
+        roi = cam.get_roi()
+        sensor = cam.sensor_shape()
+        roi_x, roi_y = roi[0], roi[1]
+        _needs_crop = roi[:2] != (0, 0) or (roi[2], roi[3]) != (
+            sensor[1],
+            sensor[0],
+        )
+
         n_components = shape[2] if len(shape) > 2 else 1
         base_meta: dict[str, Any] = {
             KW.Binning: cam.get_property_value(KW.Binning),
             KW.Metadata_CameraLabel: camera_label,
             KW.Metadata_Height: str(shape[0]),
             KW.Metadata_Width: str(shape[1]),
-            KW.Metadata_ROI_X: "0",
-            KW.Metadata_ROI_Y: "0",
+            KW.Metadata_ROI_X: str(roi_x),
+            KW.Metadata_ROI_Y: str(roi_y),
             KW.PixelType: PixelType.for_bytes(dtype.itemsize, n_components),
         }
 
+        # Core-level crop fallback for start_sequence adapters that
+        # don't handle ROI themselves (they request sensor-sized buffers).
+        _crop_buf: np.ndarray | None = None
+
         def get_buffer_with_overflow_handling(
-            shape: Sequence[int], dtype: DTypeLike
+            req_shape: Sequence[int], req_dtype: DTypeLike
         ) -> np.ndarray:
+            nonlocal _crop_buf
+            if _needs_crop and tuple(req_shape)[:2] == sensor[:2]:
+                # Adapter requested full-sensor buffer — give a temp buffer
+                # and we'll crop in finalize.
+                _crop_buf = np.empty(req_shape, dtype=req_dtype)
+                return _crop_buf
+            # Adapter already handles ROI (or no ROI) — pass through
+            _crop_buf = None
             try:
-                return self._seq_buffer.acquire_slot(shape, dtype)
+                return self._seq_buffer.acquire_slot(req_shape, req_dtype)
             except BufferError:
                 if not stop_on_overflow:  # we shouldn't get here...
                     raise  # pragma: no cover
@@ -1152,9 +1183,24 @@ class UniMMCore(CMMCorePlus):
 
         # Create metadata-injecting wrapper for finalize callback
         def finalize_with_metadata(cam_meta: Mapping) -> None:
+            nonlocal _crop_buf
             img_number = next(counter)
             elapsed_ms = (perf_counter_ns() - start_time) / 1e6
             received = datetime.now().isoformat(sep=" ")
+
+            if _crop_buf is not None and _needs_crop:
+                # Adapter didn't handle ROI — crop full frame into circ buffer
+                x, y, w, h = roi
+                cropped = _crop_buf[y : y + h, x : x + w]
+                try:
+                    slot = self._seq_buffer.acquire_slot(cropped.shape, cropped.dtype)
+                except BufferError:
+                    if not stop_on_overflow:
+                        raise  # pragma: no cover
+                    raise BufferOverflowStop() from None
+                slot[:] = cropped
+                _crop_buf = None
+
             self._seq_buffer.finalize_slot(
                 {
                     **base_meta,
@@ -1503,10 +1549,10 @@ class UniMMCore(CMMCorePlus):
             cam.set_exposure(*args)
 
     def _do_set_roi(self, label: str, x: int, y: int, width: int, height: int) -> None:
-        if self._py_camera(label) is not None:
-            raise NotImplementedError(
-                "setROI is not yet implemented for Python cameras."
-            )
+        if (cam := self._py_camera(label)) is not None:
+            with cam:
+                cam.set_roi(x, y, width, height)
+            return
         return pymmcore.CMMCore.setROI(self, label, x, y, width, height)
 
     @overload
@@ -1515,19 +1561,18 @@ class UniMMCore(CMMCorePlus):
     def getROI(self, label: DeviceLabel | str) -> list[int]: ...
     def getROI(self, label: DeviceLabel | str = "") -> list[int]:
         """Get the current region of interest (ROI) for the camera."""
-        if self._py_camera(label) is not None:  # pragma: no cover
-            raise NotImplementedError(
-                "getROI is not yet implemented for Python cameras."
-            )
+        if (cam := self._py_camera(label)) is not None:
+            with cam:
+                return list(cam.get_roi())
         label = label or self.getCameraDevice()
         return super().getROI(label)
 
     def clearROI(self) -> None:
         """Clear the current region of interest (ROI) for the camera."""
-        if self._py_camera() is not None:  # pragma: no cover
-            raise NotImplementedError(
-                "clearROI is not yet implemented for Python cameras."
-            )
+        if (cam := self._py_camera()) is not None:
+            with cam:
+                cam.clear_roi()
+            return
         return super().clearROI()
 
     def isExposureSequenceable(self, cameraLabel: DeviceLabel | str) -> bool:

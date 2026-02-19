@@ -707,15 +707,14 @@ def test_load_system_configuration_python_device_as_camera(tmp_path):
         def set_exposure(self, ms):
             self._exp = ms
 
-        def shape(self):
+        def sensor_shape(self):
             return (512, 512)
 
         def dtype(self):
             return "uint16"
 
-        def start_sequence(self, n_images=None, get_buffer=None):
-            # Minimal implementation for testing
-            return iter([])
+        def snap(self, buffer):
+            return {}
 
     # Register it in this module's namespace for import
     import sys

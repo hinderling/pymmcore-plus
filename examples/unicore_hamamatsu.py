@@ -67,8 +67,8 @@ class HamaCam(CameraDevice):
         exp_s = exposure / 1000.0
         self._hdcam.dcamprop_setvalue(dc.DCAMIDPROP.DCAM_IDPROP_EXPOSURETIME, exp_s)
 
-    def shape(self) -> tuple[int, ...]:
-        """Return the shape of the image buffer."""
+    def sensor_shape(self) -> tuple[int, ...]:
+        """Return the full sensor shape of the image buffer."""
         hdcam = self._hdcam
         width = int(hdcam.dcamprop_getvalue(dc.DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH))
         height = int(hdcam.dcamprop_getvalue(dc.DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT))
@@ -91,7 +91,7 @@ class HamaCam(CameraDevice):
         get_buffer: Callable[[Sequence[int], DTypeLike], np.ndarray],
     ) -> Iterator[Mapping]:
         """Stream `n_frames` images, yielding a dict per frame as UniMMCore expects."""
-        shape, dtype = self.shape(), self.dtype()
+        shape, dtype = self.sensor_shape(), self.dtype()
         hdcam = self._hdcam
         hdcam.dcambuf_alloc(min(n_frames, 64))  # internal DCAM ring buffer
         hwait = hdcam.dcamwait_open()

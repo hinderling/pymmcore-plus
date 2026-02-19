@@ -93,6 +93,12 @@ def make_cool_image(
 
 
 class MyCamera(CameraDevice):
+    """Simple camera using the snap() API.
+
+    For most cameras, implementing snap() is the easiest approach.
+    The base class handles ROI cropping and sequence looping automatically.
+    """
+
     _exposure: float = 10.0
 
     def get_exposure(self) -> float:
@@ -101,11 +107,39 @@ class MyCamera(CameraDevice):
     def set_exposure(self, exposure: float) -> None:
         self._exposure = exposure
 
-    def shape(self) -> tuple[int, int]:
+    def sensor_shape(self) -> tuple[int, int]:
         return (480, 640)
 
     def dtype(self) -> DTypeLike:
         """Return the data type of the image buffer."""
+        return np.uint8
+
+    def snap(self, buffer: np.ndarray) -> Mapping:
+        """Snap a single full-frame image."""
+        time.sleep(self._exposure / 1000.0)
+        buffer[:] = make_cool_image(self.sensor_shape(), self.dtype(), self._exposure)
+        return {"timestamp": time.time()}
+
+
+class MyStartSequenceCamera(CameraDevice):
+    """Camera using start_sequence() for full acquisition control.
+
+    Use this pattern when your camera needs custom acquisition loops,
+    e.g. hardware-triggered sequences or callback-based APIs.
+    """
+
+    _exposure: float = 10.0
+
+    def get_exposure(self) -> float:
+        return self._exposure
+
+    def set_exposure(self, exposure: float) -> None:
+        self._exposure = exposure
+
+    def sensor_shape(self) -> tuple[int, int]:
+        return (480, 640)
+
+    def dtype(self) -> DTypeLike:
         return np.uint8
 
     def start_sequence(
@@ -115,19 +149,18 @@ class MyCamera(CameraDevice):
     ) -> Iterator[Mapping]:
         """Start a sequence acquisition."""
         if n is None:
-            n = 2**63  # Use a large number to simulate continuous acquisition
+            n = 2**63
         try:
             for _i in range(n):
-                # Simulate image acquisition with current exposure time
-                time.sleep(self._exposure / 1000.0)  # Convert ms to seconds
-
-                buf = get_buffer(self.shape(), self.dtype())
-                buf[:] = make_cool_image(self.shape(), self.dtype(), self._exposure)
-
-                yield {"timestamp": time.time()}  # any metadata
+                time.sleep(self._exposure / 1000.0)
+                buf = get_buffer(self.sensor_shape(), self.dtype())
+                buf[:] = make_cool_image(
+                    self.sensor_shape(), self.dtype(), self._exposure
+                )
+                yield {"timestamp": time.time()}
         finally:
             ...
-            # any cleanup code, e.g. stopping the camera or releasing resources
+            # any cleanup code
 
     # this is what a start_sequence method might look like if your camera
     # driver API requires a callback that it will call when an image is ready.

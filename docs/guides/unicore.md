@@ -127,18 +127,53 @@ class MyCamera(CameraDevice):
         """Set exposure time in milliseconds."""
         pass
     
-    def shape(self) -> tuple[int, ...]:
-        """Return (height, width, [channels]) of current camera state."""
+    def sensor_shape(self) -> tuple[int, ...]:
+        """Return (height, width, [channels]) of full sensor."""
         pass
-    
+
     def dtype(self) -> np.dtype:
         """Return NumPy dtype of camera images."""
         pass
-    
-    def start_sequence(self, n: int | None, get_buffer: Callable) -> Iterator[dict]:
-        """Start sequence acquisition yielding metadata dicts."""
+
+    def snap(self, buffer: np.ndarray) -> dict:
+        """Snap a single image into the provided full-frame buffer."""
         pass
 ```
+
+For most cameras, implementing `snap()` is the simplest approach — the base class
+handles ROI cropping and sequence looping automatically. If your camera needs full
+control over the acquisition loop (e.g. hardware-triggered sequences or
+callback-based APIs), override `start_sequence()` instead:
+
+```python
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from numpy.typing import DTypeLike
+
+class MySequenceCamera(CameraDevice):
+    # ... get_exposure, set_exposure, sensor_shape, dtype as above ...
+
+    def start_sequence(
+        self,
+        n: int | None,
+        get_buffer: Callable[[Sequence[int], DTypeLike], np.ndarray],
+    ) -> Iterator[Mapping]:
+        """Start a sequence acquisition with full control."""
+        shape, dtype = self.sensor_shape(), self.dtype()
+        count = 0
+        limit = n if n is not None else 2**63
+        while count < limit:
+            buffer = get_buffer(shape, dtype)
+            buffer[:] = ...  # fill from your camera driver
+            yield {"timestamp": ...}  # metadata
+            count += 1
+```
+
+!!! note
+    Software ROI works automatically for both patterns. The base class
+    owns `shape()` (ROI-aware) while adapters implement `sensor_shape()`
+    (full sensor). Cameras using `snap()` get cropping via the default
+    `start_sequence()`. Cameras overriding `start_sequence()` get
+    core-level crop fallback when they request full-sensor-sized buffers.
 
 ### XY Stage Devices (`XYStageDevice`)
 

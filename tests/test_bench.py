@@ -15,7 +15,7 @@ from pymmcore_plus.experimental.unicore.core._sequence_buffer import SequenceBuf
 from pymmcore_plus.experimental.unicore.core._unicore import UniMMCore
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Mapping
 
     from numpy.typing import DTypeLike
 
@@ -154,23 +154,19 @@ class MyCamera(CameraDevice):
     def set_exposure(self, exposure: float) -> None:
         pass
 
-    def shape(self) -> tuple[int, int]:
-        """Return the shape of the current camera state."""
+    def sensor_shape(self) -> tuple[int, int]:
+        """Return the full sensor shape."""
         return FRAME_SHAPE
 
     def dtype(self) -> DTypeLike:
         """Return the data type of the current camera state."""
         return DTYPE
 
-    def start_sequence(
-        self, n: int, get_buffer: Callable[[Sequence[int], DTypeLike], np.ndarray]
-    ) -> Iterator[Mapping]:
-        """Start a sequence acquisition."""
-        shape, dtype = self.shape(), self.dtype()
-        for _ in range(n):
-            time.sleep(0.001)
-            get_buffer(shape, dtype)[:] = FRAME
-            yield {}
+    def snap(self, buffer: np.ndarray) -> Mapping:
+        """Snap a single image."""
+        time.sleep(0.001)
+        buffer[:] = FRAME
+        return {}
 
 
 @pytest.mark.parametrize("device", ["python", "c++"])
