@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import os
 import re
+import sys
 import time
 import warnings
 import weakref
@@ -132,6 +134,16 @@ if TYPE_CHECKING:
         XYStageDevice: str
         ZPosition: float | tuple[str, float]
 
+
+_IN_GC = False
+
+
+def _gc_phase_cb(phase: str, info: dict) -> None:
+    global _IN_GC
+    _IN_GC = phase == "start"
+
+
+gc.callbacks.append(_gc_phase_cb)
 
 _OBJDEV_REGEX = re.compile("(.+)?(nosepiece|obj(ective)?)(turret)?s?", re.IGNORECASE)
 _CHANNEL_REGEX = re.compile("(chan{1,2}(el)?|filt(er)?)s?", re.IGNORECASE)
@@ -337,16 +349,17 @@ class CMMCorePlus(pymmcore.CMMCore):
         try:
             if hasattr(self, "_weak_clean"):
                 atexit.unregister(self._weak_clean)
-            # Null the C++ callback pointer while _callback_relay is still alive.
-            # Without this, the C++ destructor's reset() can fire callbacks through
-            # a dangling pointer after Python has already freed _callback_relay.
-            super().registerCallback(None)
+            # Skip the SWIG call during GC or interpreter shutdown.
+            # SWIG's registerCallback wrapper releases/reacquires the GIL
+            # (PyEval_SaveThread/PyEval_RestoreThread), which causes access
+            # violations on Windows when __del__ runs inside the cyclic GC
+            # triggered during C++/Qt teardown (e.g. vispy layer removal).
+            # The C++ ~CMMCore() destructor already calls registerCallback(nullptr)
+            # before reset(), so skipping here is safe — no dangling pointer.
+            if not _IN_GC and not sys.is_finalizing():
+                super().registerCallback(None)
         except Exception:
             pass
-        # Do NOT call reset()/setPrimaryLogFile() — the C++ destructor handles
-        # those, and calling them from __del__ can cause access violations on
-        # Windows when GC triggers during unrelated C++/Qt teardown (e.g. vispy
-        # layer removal in napari).
 
     # Re-implemented methods from the CMMCore API
 
